@@ -2,13 +2,21 @@ import AppKit
 
 // MARK: - NotchHoverDetector
 // An invisible tracking window positioned at the MacBook Pro notch.
-// Detects a 2-second mouse hover dwell to trigger the control panel.
+// Detects a configurable mouse hover dwell to trigger the control panel.
 final class NotchHoverDetector {
 
     private var trackingWindow: NSWindow?
     private var hoverTimer: Timer?
-    private let dwellDuration: TimeInterval = 2.0
     var onHoverTriggered: (() -> Void)?
+
+    /// UserDefaults key for hover delay preference.
+    static let hoverDelayKey = "com.understory.notchHoverDelay"
+
+    /// The current dwell duration, read from UserDefaults (default 2.0s).
+    var dwellDuration: TimeInterval {
+        let stored = UserDefaults.standard.double(forKey: Self.hoverDelayKey)
+        return stored > 0 ? stored : 2.0
+    }
 
     init() {
         setupTrackingWindow()
@@ -26,16 +34,15 @@ final class NotchHoverDetector {
             backing: .buffered,
             defer: false
         )
-        window.level = .statusBar + 1  // Above menu bar so we can track there
+        window.level = .statusBar + 1
         window.backgroundColor = .clear
         window.isOpaque = false
         window.hasShadow = false
-        window.ignoresMouseEvents = false  // We NEED mouse events for tracking
+        window.ignoresMouseEvents = false
         window.collectionBehavior = [.stationary, .canJoinAllSpaces, .ignoresCycle, .fullScreenNone]
         window.isReleasedWhenClosed = false
-        window.alphaValue = 0.01  // Near-invisible but still tracks mouse
+        window.alphaValue = 0.01
 
-        // Content view with tracking area
         let contentView = NotchTrackingView(frame: NSRect(origin: .zero, size: zone.size))
         contentView.onMouseEntered = { [weak self] in self?.startDwellTimer() }
         contentView.onMouseExited = { [weak self] in self?.cancelDwellTimer() }
@@ -47,7 +54,6 @@ final class NotchHoverDetector {
 
     // MARK: - Notch Geometry
 
-    /// Find the screen with a notch (safeAreaInsets.top > 0)
     private func notchScreen() -> NSScreen? {
         for screen in NSScreen.screens {
             if screen.safeAreaInsets.top > 0 {
@@ -57,14 +63,13 @@ final class NotchHoverDetector {
         return nil
     }
 
-    /// Calculate the invisible tracking zone at the notch position
     private func notchZone(for screen: NSScreen) -> NSRect {
         let frame = screen.frame
-        let notchWidth: CGFloat = 280   // Wider than the physical notch for easier access
-        let notchHeight: CGFloat = 60   // Deeper trigger zone below the menu bar
+        let notchWidth: CGFloat = 280
+        let notchHeight: CGFloat = 60
 
         let x = frame.midX - notchWidth / 2
-        let y = frame.maxY - notchHeight  // Top of screen in AppKit coordinates
+        let y = frame.maxY - notchHeight
 
         return NSRect(x: x, y: y, width: notchWidth, height: notchHeight)
     }
@@ -95,7 +100,6 @@ final class NotchHoverDetector {
 }
 
 // MARK: - Tracking View
-// A transparent NSView that uses NSTrackingArea to detect mouse enter/exit.
 private class NotchTrackingView: NSView {
 
     var onMouseEntered: (() -> Void)?
@@ -103,11 +107,9 @@ private class NotchTrackingView: NSView {
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
-        // Remove old tracking areas
         for area in trackingAreas {
             removeTrackingArea(area)
         }
-        // Add a new one covering the full view
         let area = NSTrackingArea(
             rect: bounds,
             options: [.mouseEnteredAndExited, .activeAlways],

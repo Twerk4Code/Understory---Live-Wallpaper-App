@@ -1,17 +1,20 @@
 import AppKit
 import AVFoundation
+import CoreMedia
+import CryptoKit
 import UniformTypeIdentifiers
 
 // MARK: - VideoRenderer
 // Manages an AVQueuePlayer + AVPlayerLooper to render a seamlessly looping video wallpaper.
-// Loads the video file into RAM once to eliminate continuous disk I/O on loop.
+// Loads the video file into RAM once; all subsequent reads are served from memory
+// via an AVAssetResourceLoaderDelegate, producing zero filesystem I/O after initial load.
 // Supports .mp4, .mov, and .livp (Live Photo) files.
 final class VideoRenderer {
 
     private var player: AVQueuePlayer?
     private var playerLayer: AVPlayerLayer?
     private var looper: AVPlayerLooper?
-    private var resourceLoader: InMemoryResourceLoader?
+    private var resourceLoader: InMemoryLoader?
     private(set) var hostView: NSView?
 
     /// Whether the video is currently playing.
@@ -24,29 +27,46 @@ final class VideoRenderer {
         didSet { player?.isMuted = isMuted }
     }
 
+    /// Stored playback speed. Use `setRate(_:)` to apply at runtime.
+    var playbackSpeed: Float = 1.0
+
+    /// Maximum file size we'll preload via mmap (512 MB).
+    private static let maxRAMCacheSize: Int = 512 * 1024 * 1024
+
     // MARK: - Setup
 
     /// Creates the video renderer and loads the media at `url`.
-    /// The video is read into RAM once; all subsequent loop iterations are served from memory.
+    /// The video is memory-mapped once; all loop iterations are served without extra disk I/O.
     func setup(url: URL, in parentView: NSView) {
         teardown()
 
         let videoURL = resolveVideoURL(from: url)
 
-        // Load the entire video file into memory to eliminate continuous disk I/O.
-        // AVPlayerLooper creates multiple AVPlayerItem copies, each of which would
-        // independently read from disk. By serving bytes from RAM, we read the file
-        // exactly once regardless of how many times it loops.
-        let loader = InMemoryResourceLoader(fileURL: videoURL)
-        self.resourceLoader = loader
+        // Determine the content type for AVFoundation
+        let ext = videoURL.pathExtension.lowercased()
+        let uti: String
+        switch ext {
+        case "mov":  uti = "com.apple.quicktime-movie"
+        case "m4v":  uti = "public.mpeg-4"
+        default:     uti = "public.mpeg-4"  // mp4 and others
+        }
 
+        // Memory-map the video for zero-disk-I/O playback.
+        // .alwaysMapped delegates paging to the kernel VM subsystem —
+        // same zero-repeated-I/O guarantee as heap-copying Data(contentsOf:),
+        // but vastly lower RSS under memory pressure because the kernel
+        // can page out and re-fault from the file without swap.
         let asset: AVURLAsset
-        if loader.isLoaded {
-            // Use the in-memory asset (custom scheme intercepted by our resource loader)
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: videoURL.path)[.size] as? Int) ?? 0
+
+        if fileSize > 0 && fileSize <= Self.maxRAMCacheSize,
+           let data = try? Data(contentsOf: videoURL, options: .alwaysMapped) {
+            let loader = InMemoryLoader(data: data, contentType: uti)
+            self.resourceLoader = loader
             asset = loader.asset
         } else {
-            // Fallback: file too large or read failed — use direct file access
-            print("⚠️ VideoRenderer: File too large for RAM cache, using disk streaming")
+            // Too large or read failed — fall back to standard file I/O
+            print("⚠️ VideoRenderer: File too large for mmap (\(fileSize) bytes), using disk")
             asset = AVURLAsset(url: videoURL)
         }
 
@@ -59,8 +79,9 @@ final class VideoRenderer {
         player.preventsDisplaySleepDuringVideoPlayback = false
         self.player = player
 
-        // AVPlayerLooper pre-buffers the loop point for gapless, seamless looping.
-        // Since the resource loader serves from RAM, loop copies don't hit disk.
+        // AVPlayerLooper creates new AVPlayerItem copies from the SAME AVURLAsset.
+        // Since the resource loader delegate is set on the asset, all copies route
+        // through our in-memory delegate — no additional disk reads.
         self.looper = AVPlayerLooper(player: player, templateItem: templateItem)
 
         let layer = AVPlayerLayer(player: player)
@@ -68,7 +89,6 @@ final class VideoRenderer {
         layer.frame = parentView.bounds
         layer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
 
-        // Host view for the AVPlayerLayer
         let host = NSView(frame: parentView.bounds)
         host.wantsLayer = true
         host.layer?.addSublayer(layer)
@@ -83,10 +103,29 @@ final class VideoRenderer {
 
     func play() {
         player?.play()
+        if playbackSpeed != 1.0 {
+            let safeRate = max(Float(0.1), min(playbackSpeed, 2.0))
+            player?.rate = safeRate
+        }
     }
 
     func pause() {
         player?.pause()
+    }
+
+    /// Unconditionally apply a new playback rate to the player.
+    /// Unlike the `playbackSpeed` property setter, this does NOT gate on `isPlaying`,
+    /// so it can never dead-lock into a stalled state during rapid slider scrubbing.
+    func setRate(_ rate: Float) {
+        playbackSpeed = rate
+        guard let player = player else { return }
+        let clamped = max(Float(0.1), min(rate, 2.0))
+        // If the player was paused (rate == 0), calling play() first
+        // ensures we re-enter the playing state before setting the rate.
+        if player.rate == 0 {
+            player.play()
+        }
+        player.rate = clamped
     }
 
     func teardown() {
@@ -99,28 +138,47 @@ final class VideoRenderer {
         playerLayer = nil
         hostView?.removeFromSuperview()
         hostView = nil
-        resourceLoader = nil  // Release the in-memory video data
+        resourceLoader = nil
     }
 
-    // MARK: - .livp Support
+    // MARK: - .livp Support (with caching)
 
-    /// If the URL is a `.livp` bundle, extract the embedded `.mov`.
-    /// Otherwise return the URL as-is.
+    /// Cache directory for extracted .livp videos.
+    private static var livpCacheDir: URL = {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        let dir = appSupport.appendingPathComponent("Understory/LivpCache", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
+    /// Deterministic cache key from a file path using SHA256.
+    private func cacheKey(for url: URL) -> String {
+        let hash = SHA256.hash(data: Data(url.path.utf8))
+        return hash.map { String(format: "%02x", $0) }.joined()
+    }
+
     private func resolveVideoURL(from url: URL) -> URL {
         guard url.pathExtension.lowercased() == "livp" else { return url }
 
-        // .livp is a zip-like package; look for a .mov inside
         let fm = FileManager.default
+
+        // .livp may be a directory (Live Photo bundle) — check for video inside
         if let contents = try? fm.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) {
             for file in contents {
                 let ext = file.pathExtension.lowercased()
-                if ext == "mov" || ext == "mp4" {
-                    return file
-                }
+                if ext == "mov" || ext == "mp4" { return file }
             }
         }
 
-        // Fallback: try treating the livp as a flat zip
+        // Need to extract — check cache first
+        let key = cacheKey(for: url)
+        let cachedMov = Self.livpCacheDir.appendingPathComponent("\(key).mov")
+        let cachedMp4 = Self.livpCacheDir.appendingPathComponent("\(key).mp4")
+
+        if fm.fileExists(atPath: cachedMov.path) { return cachedMov }
+        if fm.fileExists(atPath: cachedMp4.path) { return cachedMp4 }
+
+        // Extract to a temp dir, then move the video into the cache
         let tempDir = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         do {
             try fm.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -138,61 +196,57 @@ final class VideoRenderer {
                 for file in extracted {
                     let ext = file.pathExtension.lowercased()
                     if ext == "mov" || ext == "mp4" {
-                        return file
+                        let cached = Self.livpCacheDir.appendingPathComponent("\(key).\(ext)")
+                        try? fm.moveItem(at: file, to: cached)
+                        try? fm.removeItem(at: tempDir)
+                        return cached
                     }
                 }
             }
+            try? fm.removeItem(at: tempDir)
         } catch {
             print("⚠️ VideoRenderer: Failed to extract .livp: \(error)")
         }
-
         return url
     }
 }
 
-// MARK: - InMemoryResourceLoader
-// Loads a video file into RAM and serves it to AVFoundation via a custom URL scheme.
-// This prevents AVPlayerLooper's internal item copies from re-reading the file from disk.
-private final class InMemoryResourceLoader: NSObject, AVAssetResourceLoaderDelegate {
+// MARK: - InMemoryLoader
+// Serves video bytes from a memory-mapped Data object to AVFoundation
+// via AVAssetResourceLoaderDelegate. Using .alwaysMapped means the kernel's
+// VM pager handles the memory — zero repeated disk I/O with graceful
+// page-out under memory pressure (no swap, just re-fault from the file).
+//
+// Thread safety: all delegate callbacks arrive on `loaderQueue` (a serial dispatch queue).
+// The `videoData` is immutable after init, so it's safe to read from any thread.
+private final class InMemoryLoader: NSObject, AVAssetResourceLoaderDelegate {
 
-    private let videoData: Data?
-    private let contentType: String
-    private let loaderQueue = DispatchQueue(label: "com.understory.resourceLoader")
+    /// The video bytes (memory-mapped), held for the lifetime of this loader.
+    let videoData: Data
+
+    /// UTI content type string (e.g. "public.mpeg-4", "com.apple.quicktime-movie").
+    let contentType: String
+
+    /// Serial queue for all resource loader delegate callbacks.
+    private let loaderQueue = DispatchQueue(label: "com.understory.memLoader", qos: .userInitiated)
+
+    /// The asset backed by this loader. AVFoundation routes all data requests through us.
     let asset: AVURLAsset
 
-    /// Maximum file size we'll load into RAM (512 MB).
-    /// Videos larger than this fall back to disk streaming.
-    private static let maxFileSize: Int = 512 * 1024 * 1024
+    init(data: Data, contentType: String) {
+        self.videoData = data
+        self.contentType = contentType
 
-    var isLoaded: Bool { videoData != nil }
-
-    init(fileURL: URL) {
-        // Determine the content type for the response
-        let ext = fileURL.pathExtension.lowercased()
-        if ext == "mov" {
-            contentType = "com.apple.quicktime-movie"
-        } else if ext == "mp4" || ext == "m4v" {
-            contentType = "public.mpeg-4"
-        } else {
-            contentType = "public.movie"
-        }
-
-        // Check file size before loading
-        let fileSize = (try? FileManager.default.attributesOfItem(atPath: fileURL.path)[.size] as? Int) ?? 0
-        if fileSize > 0 && fileSize <= Self.maxFileSize {
-            self.videoData = try? Data(contentsOf: fileURL)
-        } else {
-            self.videoData = nil
-        }
-
-        // Create an asset with a custom URL scheme so AVFoundation routes
-        // all data requests through our delegate instead of reading from disk.
-        let customURL = URL(string: "understory-mem://video.\(ext)")!
+        // Use a custom URL scheme so AVFoundation routes through our delegate.
+        // The UUID ensures uniqueness even if multiple renderers exist (multi-monitor).
+        let scheme = "understory-mem"
+        let uniqueID = UUID().uuidString
+        let customURL = URL(string: "\(scheme)://\(uniqueID)/video")!
         self.asset = AVURLAsset(url: customURL)
 
         super.init()
 
-        // Set ourselves as the resource loader delegate BEFORE anyone accesses the asset's tracks
+        // IMPORTANT: set delegate BEFORE anything accesses the asset's properties.
         asset.resourceLoader.setDelegate(self, queue: loaderQueue)
     }
 
@@ -202,29 +256,51 @@ private final class InMemoryResourceLoader: NSObject, AVAssetResourceLoaderDeleg
         _ resourceLoader: AVAssetResourceLoader,
         shouldWaitForLoadingOfRequestedResource loadingRequest: AVAssetResourceLoadingRequest
     ) -> Bool {
-        guard let data = videoData else { return false }
 
-        // Fill in the content information
-        if let contentRequest = loadingRequest.contentInformationRequest {
-            contentRequest.contentType = contentType
-            contentRequest.contentLength = Int64(data.count)
-            contentRequest.isByteRangeAccessSupported = true
+        // ── Content information ──────────────────────────────────────
+        if let contentInfo = loadingRequest.contentInformationRequest {
+            contentInfo.contentType = contentType
+            contentInfo.contentLength = Int64(videoData.count)
+            contentInfo.isByteRangeAccessSupported = true
         }
 
-        // Serve the requested byte range from our in-memory data
+        // ── Data response ────────────────────────────────────────────
         if let dataRequest = loadingRequest.dataRequest {
-            let requestedOffset = Int(dataRequest.requestedOffset)
-            let requestedLength = dataRequest.requestedLength
-            let availableLength = data.count - requestedOffset
+            let startOffset: Int
+            if dataRequest.currentOffset != 0 {
+                startOffset = Int(dataRequest.currentOffset)
+            } else {
+                startOffset = Int(dataRequest.requestedOffset)
+            }
 
-            if availableLength <= 0 {
+            let bytesRemaining = videoData.count - startOffset
+            guard bytesRemaining > 0 else {
                 loadingRequest.finishLoading()
                 return true
             }
 
-            let respondLength = min(requestedLength, availableLength)
-            let range = requestedOffset ..< (requestedOffset + respondLength)
-            dataRequest.respond(with: data.subdata(in: range))
+            let bytesToRespond: Int
+            if dataRequest.requestsAllDataToEndOfResource {
+                bytesToRespond = bytesRemaining
+            } else {
+                let requestedLength = dataRequest.requestedLength
+                let alreadyResponded = startOffset - Int(dataRequest.requestedOffset)
+                bytesToRespond = min(requestedLength - alreadyResponded, bytesRemaining)
+            }
+
+            guard bytesToRespond > 0 else {
+                loadingRequest.finishLoading()
+                return true
+            }
+
+            // Serve bytes directly from mmap'd pages — no filesystem access
+            videoData.withUnsafeBytes { rawBuffer in
+                let ptr = rawBuffer.baseAddress!.advanced(by: startOffset)
+                dataRequest.respond(with: Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: ptr),
+                                               count: bytesToRespond,
+                                               deallocator: .none))
+            }
+
             loadingRequest.finishLoading()
         }
 
@@ -235,6 +311,6 @@ private final class InMemoryResourceLoader: NSObject, AVAssetResourceLoaderDeleg
         _ resourceLoader: AVAssetResourceLoader,
         didCancel loadingRequest: AVAssetResourceLoadingRequest
     ) {
-        // No cleanup needed — data is served synchronously from memory
+        // Nothing to clean up — responses are synchronous from memory
     }
 }

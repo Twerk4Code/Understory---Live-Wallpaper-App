@@ -1,21 +1,22 @@
 import AppKit
+import AVFoundation
 
-// MARK: - WallpaperMode
-enum WallpaperMode: Codable, Equatable {
-    case idle          // No video selected — native desktop wallpaper shows through
-    case video(url: URL)
-}
+// Enums moved to WallpaperSettings.swift
 
 // MARK: - Per-Screen Context
 // Groups a window, renderers, display-link, and lifecycle manager for one monitor.
 private final class ScreenContext {
-    let screen: NSScreen
+    let displayID: CGDirectDisplayID
     let window: WallpaperWindow
     var videoRenderer: VideoRenderer?
     var lifecycleManager: LifecycleManager?
+    /// The URL currently loaded in the renderer. Used to avoid redundant teardown/setup.
+    var activeVideoURL: URL?
+    /// Persistent host view — we reuse this so contentView is never nil (prevents flash).
+    var hostView: NSView?
 
-    init(screen: NSScreen) {
-        self.screen = screen
+    init(screen: NSScreen, displayID: CGDirectDisplayID) {
+        self.displayID = displayID
         self.window = WallpaperWindow(for: screen)
     }
 }
@@ -25,8 +26,8 @@ private final class ScreenContext {
 // Defaults to .idle (native wallpaper) until the user picks a video.
 final class WallpaperManager {
 
-    private var contexts: [ScreenContext] = []
-    private(set) var mode: WallpaperMode = .idle
+    private var contexts: [CGDirectDisplayID: ScreenContext] = [:]
+    private(set) var settings: [CGDirectDisplayID: ScreenSettings] = [:]
     private var screenObserver: Any?
     private var screenChangeDebounce: DispatchWorkItem?
 
@@ -37,12 +38,12 @@ final class WallpaperManager {
     // MARK: - Lifecycle
 
     func start() {
-        buildContexts()
+        reconcileContexts()
         observeScreenChanges()
     }
 
     func stop() {
-        for ctx in contexts {
+        for (_, ctx) in contexts {
             teardown(ctx)
         }
         contexts.removeAll()
@@ -50,17 +51,60 @@ final class WallpaperManager {
             NotificationCenter.default.removeObserver(obs)
             screenObserver = nil
         }
+        if let obs = themeObserver {
+            DistributedNotificationCenter.default().removeObserver(obs)
+            themeObserver = nil
+        }
+        customTimeTimer?.invalidate()
+        customTimeTimer = nil
     }
 
     // MARK: - Mode Switching
 
-    func setMode(_ newMode: WallpaperMode) {
-        guard newMode != mode else { return }
-        mode = newMode
-        persistMode()
-        for ctx in contexts {
-            teardownRenderers(ctx)
-            setupRenderers(ctx)
+    func updateSettings(for screenID: CGDirectDisplayID?, newSettings: ScreenSettings) {
+        if let id = screenID {
+            settings[id] = newSettings
+        } else {
+            for screen in NSScreen.screens {
+                let id = screenDisplayID(screen)
+                settings[id] = newSettings
+            }
+        }
+
+        persistSettings()
+
+        for (id, ctx) in contexts {
+            guard screenID == nil || screenID == id else { continue }
+
+            let targetURL = resolveActiveURL(for: newSettings)
+
+            if targetURL != ctx.activeVideoURL {
+                // The actual video to play changed — swap without flash
+                swapRenderers(ctx)
+            } else {
+                // Same video — just update live properties (speed)
+                applyLiveSettings(to: ctx, settings: newSettings)
+            }
+        }
+    }
+
+    /// Determine which URL should actually be playing right now for a given settings config.
+    private func resolveActiveURL(for s: ScreenSettings) -> URL? {
+        switch s.mode {
+        case .idle:
+            return nil
+        case .video(let url):
+            return url
+        case .folder(let url):
+            return url
+        case .dayNight(_, _):
+            return evaluateDayNightURL(for: s)
+        }
+    }
+
+    private func applyLiveSettings(to ctx: ScreenContext, settings: ScreenSettings) {
+        if let renderer = ctx.videoRenderer {
+            renderer.setRate(settings.playbackSpeed)
         }
     }
 
@@ -70,7 +114,7 @@ final class WallpaperManager {
 
     func togglePause() {
         isPaused.toggle()
-        for ctx in contexts {
+        for (_, ctx) in contexts {
             if isPaused {
                 pauseContext(ctx)
             } else {
@@ -86,69 +130,163 @@ final class WallpaperManager {
     func toggleMute() {
         isMuted.toggle()
         UserDefaults.standard.set(isMuted, forKey: "com.understory.isMuted")
-        for ctx in contexts {
+        for (_, ctx) in contexts {
             ctx.videoRenderer?.isMuted = isMuted
         }
     }
 
-    // MARK: - Build / Teardown
+    // MARK: - Build / Teardown (Incremental Reconciliation)
 
-    private func buildContexts() {
-        // Remove old
-        for ctx in contexts { teardown(ctx) }
-        contexts.removeAll()
+    private func reconcileContexts() {
+        let currentScreens = NSScreen.screens
+        var liveIDs = Set<CGDirectDisplayID>()
 
-        for screen in NSScreen.screens {
-            let ctx = ScreenContext(screen: screen)
-            setupRenderers(ctx)
-            // setupRenderers handles window visibility:
-            //   .idle  → orderOut (hidden, native wallpaper shows)
-            //   .video → orderFrontRegardless (video plays)
-            contexts.append(ctx)
+        for screen in currentScreens {
+            let id = screenDisplayID(screen)
+            liveIDs.insert(id)
+
+            if contexts[id] == nil {
+                let ctx = ScreenContext(screen: screen, displayID: id)
+                contexts[id] = ctx
+                setupRenderers(ctx)
+            }
+        }
+
+        let staleIDs = Set(contexts.keys).subtracting(liveIDs)
+        for id in staleIDs {
+            if let ctx = contexts.removeValue(forKey: id) {
+                teardown(ctx)
+            }
         }
     }
 
-    private func setupRenderers(_ ctx: ScreenContext) {
-        let screen = ctx.screen
-        let window = ctx.window
+    // MARK: - Folder Logic
 
-        switch mode {
+    private var folderTimers: [CGDirectDisplayID: Timer] = [:]
+
+    private func pickRandomVideo(from folderURL: URL) -> URL? {
+        let fm = FileManager.default
+        let ext = ["mp4", "mov", "livp"]
+        guard let files = try? fm.contentsOfDirectory(at: folderURL, includingPropertiesForKeys: nil) else { return nil }
+        let videoFiles = files.filter { ext.contains($0.pathExtension.lowercased()) }
+        return videoFiles.randomElement()
+    }
+
+    private func startFolderTimer(for ctx: ScreenContext, folderURL: URL) {
+        let id = ctx.displayID
+        let screenSettings = settings[id] ?? .defaultSettings
+        folderTimers[id]?.invalidate()
+        let timer = Timer.scheduledTimer(withTimeInterval: screenSettings.cycleInterval, repeats: true) { [weak self] _ in
+            guard let self = self else { return }
+            self.swapRenderers(ctx)
+        }
+        folderTimers[id] = timer
+    }
+
+    private func stopFolderTimer(for ctx: ScreenContext) {
+        let id = ctx.displayID
+        folderTimers[id]?.invalidate()
+        folderTimers[id] = nil
+    }
+
+    // MARK: - Flash-Free Renderer Swap
+
+    /// Sets up a new video renderer on top of the old one, starts playback,
+    /// then tears down the old renderer underneath. This prevents any frame
+    /// where the macOS wallpaper is visible.
+    private func swapRenderers(_ ctx: ScreenContext) {
+        let oldRenderer = ctx.videoRenderer
+        let oldHostView = ctx.videoRenderer?.hostView
+
+        // Stop folder timer (will be re-started by setupRenderers if needed)
+        stopFolderTimer(for: ctx)
+
+        // Set up the new renderer — this adds a new subview on top
+        setupRenderers(ctx)
+
+        // Now tear down the OLD renderer underneath
+        oldRenderer?.teardown()
+        oldHostView?.removeFromSuperview()
+    }
+
+    private func setupRenderers(_ ctx: ScreenContext) {
+        let window = ctx.window
+        let id = ctx.displayID
+        let screenSettings = settings[id] ?? .defaultSettings
+
+        var videoURLToPlay: URL?
+
+        switch screenSettings.mode {
         case .idle:
-            // No rendering — hide the window so the native desktop wallpaper shows through
+            ctx.activeVideoURL = nil
+            teardownRenderers(ctx)
             window.orderOut(nil)
             return
 
         case .video(let url):
-            let hostView = NSView(frame: screen.frame)
-            hostView.wantsLayer = true
-            hostView.autoresizingMask = [.width, .height]
-            window.contentView = hostView
+            videoURLToPlay = url
 
-            let videoRenderer = VideoRenderer()
-            videoRenderer.isMuted = isMuted
-            videoRenderer.setup(url: url, in: hostView)
-            ctx.videoRenderer = videoRenderer
+        case .folder(let url):
+            videoURLToPlay = pickRandomVideo(from: url)
+            startFolderTimer(for: ctx, folderURL: url)
 
-            // Lifecycle
-            ctx.lifecycleManager = LifecycleManager(window: window) { [weak videoRenderer, weak self] visible in
-                guard let self = self, !self.isPaused else { return }
-                visible ? videoRenderer?.play() : videoRenderer?.pause()
-            }
-
-            window.orderFrontRegardless()
-            videoRenderer.play()
+        case .dayNight(_, _):
+            videoURLToPlay = evaluateDayNightURL(for: screenSettings)
         }
+
+        guard let url = videoURLToPlay else {
+            ctx.activeVideoURL = nil
+            teardownRenderers(ctx)
+            window.orderOut(nil)
+            return
+        }
+
+        ctx.activeVideoURL = url
+
+        // Ensure we have a persistent host view on the window
+        let screen = NSScreen.screens.first(where: { screenDisplayID($0) == id })
+        let frame = screen?.frame ?? NSScreen.main!.frame
+
+        if ctx.hostView == nil {
+            let host = NSView(frame: frame)
+            host.wantsLayer = true
+            host.autoresizingMask = [.width, .height]
+            window.contentView = host
+            ctx.hostView = host
+        }
+
+        guard let hostView = ctx.hostView else { return }
+
+        let videoRenderer = VideoRenderer()
+        videoRenderer.isMuted = isMuted
+        videoRenderer.playbackSpeed = screenSettings.playbackSpeed
+        videoRenderer.setup(url: url, in: hostView)
+
+        ctx.videoRenderer = videoRenderer
+
+        ctx.lifecycleManager = LifecycleManager(window: window) { [weak videoRenderer, weak self] visible in
+            guard let self = self, !self.isPaused else { return }
+            visible ? videoRenderer?.play() : videoRenderer?.pause()
+        }
+
+        window.orderFrontRegardless()
+        videoRenderer.play()
     }
 
     private func teardownRenderers(_ ctx: ScreenContext) {
+        stopFolderTimer(for: ctx)
         ctx.videoRenderer?.teardown()
         ctx.videoRenderer = nil
         ctx.lifecycleManager = nil
-        ctx.window.contentView = nil
+        ctx.activeVideoURL = nil
+        // NOTE: we do NOT nil out ctx.hostView or window.contentView here
+        // to avoid flashing the macOS wallpaper.
     }
 
     private func teardown(_ ctx: ScreenContext) {
         teardownRenderers(ctx)
+        ctx.hostView = nil
+        ctx.window.contentView = nil
         ctx.window.orderOut(nil)
     }
 
@@ -160,7 +298,32 @@ final class WallpaperManager {
         ctx.videoRenderer?.play()
     }
 
+    // MARK: - Day/Night Evaluator
+
+    private func evaluateDayNightURL(for settings: ScreenSettings) -> URL? {
+        guard case .dayNight(let dayURL, let nightURL) = settings.mode else { return nil }
+
+        let isNight: Bool
+        switch settings.dayNightSchedule {
+        case .systemAppearance:
+            isNight = UserDefaults.standard.string(forKey: "AppleInterfaceStyle") == "Dark"
+        case .customTimes(let nightFrom, let nightTo):
+            let hour = Calendar.current.component(.hour, from: Date())
+            if nightFrom <= nightTo {
+                // e.g. nightFrom=1, nightTo=6 → night is [1, 6)
+                isNight = hour >= nightFrom && hour < nightTo
+            } else {
+                // e.g. nightFrom=19, nightTo=7 → night is [19, 24) ∪ [0, 7)
+                isNight = hour >= nightFrom || hour < nightTo
+            }
+        }
+        return isNight ? nightURL : dayURL
+    }
+
     // MARK: - Screen Changes
+
+    private var themeObserver: Any?
+    private var customTimeTimer: Timer?
 
     private func observeScreenChanges() {
         screenObserver = NotificationCenter.default.addObserver(
@@ -168,15 +331,52 @@ final class WallpaperManager {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.debouncedBuildContexts()
+            self?.debouncedReconcile()
+        }
+
+        themeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: Notification.Name("AppleInterfaceThemeChangedNotification"),
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.handleThemeChange()
+        }
+
+        customTimeTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            self?.checkCustomTimeSchedules()
         }
     }
 
-    /// Debounce rapid-fire screen-change notifications (macOS sends several on hotplug).
-    private func debouncedBuildContexts() {
+    private func handleThemeChange() {
+        for (id, ctx) in contexts {
+            let s = settings[id] ?? .defaultSettings
+            guard case .dayNight(_, _) = s.mode,
+                  case .systemAppearance = s.dayNightSchedule else { continue }
+
+            let newURL = evaluateDayNightURL(for: s)
+            if newURL != ctx.activeVideoURL {
+                swapRenderers(ctx)
+            }
+        }
+    }
+
+    private func checkCustomTimeSchedules() {
+        for (id, ctx) in contexts {
+            let s = settings[id] ?? .defaultSettings
+            guard case .dayNight(_, _) = s.mode,
+                  case .customTimes(_, _) = s.dayNightSchedule else { continue }
+
+            let newURL = evaluateDayNightURL(for: s)
+            if newURL != ctx.activeVideoURL {
+                swapRenderers(ctx)
+            }
+        }
+    }
+
+    private func debouncedReconcile() {
         screenChangeDebounce?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            self?.buildContexts()
+            self?.reconcileContexts()
         }
         screenChangeDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
@@ -184,42 +384,46 @@ final class WallpaperManager {
 
     // MARK: - Helpers
 
-    private func screenDisplayID(_ screen: NSScreen) -> CGDirectDisplayID {
+    func screenDisplayID(_ screen: NSScreen) -> CGDirectDisplayID {
         let key = NSDeviceDescriptionKey("NSScreenNumber")
         return screen.deviceDescription[key] as? CGDirectDisplayID ?? CGMainDisplayID()
     }
 
     // MARK: - Persistence (Security-Scoped Bookmarks for Sandbox)
 
-    private static let modeKey = "com.understory.wallpaperMode"
-    private static let bookmarkKey = "com.understory.videoBookmark"
-    private static let videoURLKey = "com.understory.videoURL"
+    private static let settingsKey = "com.understory.screenSettings"
+    private static let bookmarksKey = "com.understory.videoBookmarks"
 
-    private func persistMode() {
-        switch mode {
-        case .idle:
-            UserDefaults.standard.removeObject(forKey: Self.modeKey)
-            UserDefaults.standard.removeObject(forKey: Self.bookmarkKey)
-            UserDefaults.standard.removeObject(forKey: Self.videoURLKey)
-        case .video(let url):
-            UserDefaults.standard.set("video", forKey: Self.modeKey)
-            UserDefaults.standard.set(url.path, forKey: Self.videoURLKey)
-            // Save a security-scoped bookmark for sandbox persistence
-            if let bookmark = try? url.bookmarkData(
-                options: [.withSecurityScope],
-                includingResourceValuesForKeys: nil,
-                relativeTo: nil
-            ) {
-                UserDefaults.standard.set(bookmark, forKey: Self.bookmarkKey)
+    private func persistSettings() {
+        if let data = settings.encode() {
+            UserDefaults.standard.set(data, forKey: Self.settingsKey)
+        }
+
+        var bookmarks: [String: Data] = [:]
+        for (_, screenSetting) in settings {
+            let urls: [URL]
+            switch screenSetting.mode {
+            case .idle: urls = []
+            case .video(let url), .folder(let url): urls = [url]
+            case .dayNight(let d, let n): urls = [d, n]
+            }
+
+            for url in urls {
+                if let bookmark = try? url.bookmarkData(
+                    options: [.withSecurityScope],
+                    includingResourceValuesForKeys: nil,
+                    relativeTo: nil
+                ) {
+                    bookmarks[url.path] = bookmark
+                }
             }
         }
+        UserDefaults.standard.set(bookmarks, forKey: Self.bookmarksKey)
     }
 
     private func loadPersistedMode() {
-        let stored = UserDefaults.standard.string(forKey: Self.modeKey)
-        if stored == "video" {
-            // Try security-scoped bookmark first (works in sandbox)
-            if let bookmarkData = UserDefaults.standard.data(forKey: Self.bookmarkKey) {
+        if let bookmarks = UserDefaults.standard.dictionary(forKey: Self.bookmarksKey) as? [String: Data] {
+            for (_, bookmarkData) in bookmarks {
                 var isStale = false
                 if let url = try? URL(
                     resolvingBookmarkData: bookmarkData,
@@ -228,20 +432,17 @@ final class WallpaperManager {
                     bookmarkDataIsStale: &isStale
                 ) {
                     _ = url.startAccessingSecurityScopedResource()
-                    mode = .video(url: url)
-                    isMuted = UserDefaults.standard.bool(forKey: "com.understory.isMuted")
-                    return
                 }
             }
-            // Fallback: try plain path (non-sandboxed builds)
-            if let path = UserDefaults.standard.string(forKey: Self.videoURLKey),
-               FileManager.default.fileExists(atPath: path) {
-                mode = .video(url: URL(fileURLWithPath: path))
-                isMuted = UserDefaults.standard.bool(forKey: "com.understory.isMuted")
-                return
-            }
         }
-        mode = .idle
+
+        if let data = UserDefaults.standard.data(forKey: Self.settingsKey),
+           let decoded = Dictionary<CGDirectDisplayID, ScreenSettings>.decode(from: data) {
+            self.settings = decoded
+        } else {
+            self.settings = [:]
+        }
+
         isMuted = UserDefaults.standard.bool(forKey: "com.understory.isMuted")
     }
 }
