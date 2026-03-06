@@ -9,6 +9,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// Whether this Mac has a notch (Apple Silicon MacBook Pro/Air with notch display).
     private var hasNotch: Bool {
+        Self.hasNotchDisplay()
+    }
+
+    /// Static helper to detect notch display across the app.
+    static func hasNotchDisplay() -> Bool {
         NSScreen.screens.contains { $0.safeAreaInsets.top > 0 }
     }
 
@@ -47,7 +52,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             // Re-enable the tracker whenever the panel dismisses
             notchPanel?.onDismiss = { [weak self] in
                 // Small delay before re-enabling to avoid immediate re-trigger
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + AppConfig.debounceDelay) {
                     self?.notchDetector?.showTracker()
                 }
             }

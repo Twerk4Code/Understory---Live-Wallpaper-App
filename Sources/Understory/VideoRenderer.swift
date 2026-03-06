@@ -1,8 +1,8 @@
 import AppKit
 import AVFoundation
-import CoreMedia
 import CryptoKit
 import UniformTypeIdentifiers
+import os
 
 // MARK: - VideoRenderer
 // Manages an AVQueuePlayer + AVPlayerLooper to render a seamlessly looping video wallpaper.
@@ -31,15 +31,17 @@ final class VideoRenderer {
     var playbackSpeed: Float = 1.0
 
     /// Maximum file size we'll preload via mmap (512 MB).
-    private static let maxRAMCacheSize: Int = 512 * 1024 * 1024
+    private static let maxRAMCacheSize: Int = AppConfig.maxRAMCacheSize
 
     // MARK: - Setup
 
     /// Creates the video renderer and loads the media at `url`.
     /// The video is memory-mapped once; all loop iterations are served without extra disk I/O.
     func setup(url: URL, in parentView: NSView) {
+        assert(Thread.isMainThread, "VideoRenderer.setup must be called from main thread")
         teardown()
 
+        os_log("Setting up video renderer for: %{public}@", log: UnderstoryLogger.video, type: .info, url.lastPathComponent)
         let videoURL = resolveVideoURL(from: url)
 
         // Determine the content type for AVFoundation
@@ -66,12 +68,12 @@ final class VideoRenderer {
             asset = loader.asset
         } else {
             // Too large or read failed — fall back to standard file I/O
-            print("⚠️ VideoRenderer: File too large for mmap (\(fileSize) bytes), using disk")
+            os_log("File too large for mmap (%{public}@ bytes), using disk", log: UnderstoryLogger.video, type: .default, String(fileSize))
             asset = AVURLAsset(url: videoURL)
         }
 
         let templateItem = AVPlayerItem(asset: asset)
-        templateItem.preferredForwardBufferDuration = 120
+        templateItem.preferredForwardBufferDuration = AppConfig.playerBufferDuration
 
         let player = AVQueuePlayer(playerItem: templateItem)
         player.isMuted = isMuted
@@ -102,6 +104,7 @@ final class VideoRenderer {
     // MARK: - Playback Control
 
     func play() {
+        assert(Thread.isMainThread, "VideoRenderer.play must be called from main thread")
         player?.play()
         if playbackSpeed != 1.0 {
             let safeRate = max(Float(0.1), min(playbackSpeed, 2.0))
@@ -110,6 +113,7 @@ final class VideoRenderer {
     }
 
     func pause() {
+        assert(Thread.isMainThread, "VideoRenderer.pause must be called from main thread")
         player?.pause()
     }
 
@@ -117,6 +121,7 @@ final class VideoRenderer {
     /// Unlike the `playbackSpeed` property setter, this does NOT gate on `isPlaying`,
     /// so it can never dead-lock into a stalled state during rapid slider scrubbing.
     func setRate(_ rate: Float) {
+        assert(Thread.isMainThread, "VideoRenderer.setRate must be called from main thread")
         playbackSpeed = rate
         guard let player = player else { return }
         let clamped = max(Float(0.1), min(rate, 2.0))
@@ -205,7 +210,7 @@ final class VideoRenderer {
             }
             try? fm.removeItem(at: tempDir)
         } catch {
-            print("⚠️ VideoRenderer: Failed to extract .livp: \(error)")
+            os_log("Failed to extract .livp: %{public}@", log: UnderstoryLogger.video, type: .error, error.localizedDescription)
         }
         return url
     }

@@ -42,7 +42,7 @@ final class StatusBarController: NSObject {
         let menu = NSMenu()
 
         // ── Show Panel (only useful on notch Macs) ──────────────────
-        let hasNotch = NSScreen.screens.contains { $0.safeAreaInsets.top > 0 }
+        let hasNotch = AppDelegate.hasNotchDisplay()
         if hasNotch {
             let panelItem = NSMenuItem(title: "Show Panel", action: #selector(showPanel), keyEquivalent: ",")
             panelItem.target = self

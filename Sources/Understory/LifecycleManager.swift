@@ -1,4 +1,5 @@
 import AppKit
+import os
 
 // MARK: - LifecycleManager
 // Observes system events to pause/resume wallpaper rendering when the desktop
@@ -100,14 +101,17 @@ final class LifecycleManager {
 
     @objc private func occlusionChanged() {
         let isVisible = window.occlusionState.contains(.visible)
+        os_log("Window visibility changed: %{public}@", log: UnderstoryLogger.lifecycle, type: .debug, isVisible ? "visible" : "hidden")
         onVisibilityChanged(isVisible)
     }
 
     @objc private func handleSleep() {
+        os_log("Display sleep detected", log: UnderstoryLogger.lifecycle, type: .debug)
         onVisibilityChanged(false)
     }
 
     @objc private func handleWake() {
+        os_log("Display wake detected", log: UnderstoryLogger.lifecycle, type: .debug)
         // Re-check occlusion after a brief delay (display may need time to initialize)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.occlusionChanged()

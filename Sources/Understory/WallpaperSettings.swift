@@ -18,8 +18,18 @@ enum WallpaperMode: Codable, Equatable {
 struct ScreenSettings: Codable, Equatable {
     var mode: WallpaperMode
     var playbackSpeed: Float
-    var tintColorHex: String? // Kept for backwards Codable compatibility
-    var tintAlpha: CGFloat    // Kept for backwards Codable compatibility
+
+    // MARK: - Deprecated (kept for backwards Codable compatibility)
+    /// Deprecated: Tint color was removed from UI in v2.0
+    /// Kept for JSON migration from older app versions.
+    /// Remove in v3.0 when we can break backwards compatibility.
+    var tintColorHex: String?
+
+    /// Deprecated: Tint alpha was removed from UI in v2.0
+    /// Kept for JSON migration from older app versions.
+    /// Remove in v3.0 when we can break backwards compatibility.
+    var tintAlpha: CGFloat
+
     var dayNightSchedule: DayNightScheduleType
     var cycleInterval: TimeInterval
     
@@ -43,7 +53,9 @@ struct ScreenSettings: Codable, Equatable {
         lastNightURL: nil
     )
     
-    // Helper to get NSColor from hex (unused but kept for compat)
+    /// Deprecated: Tint color was removed from UI in v2.0
+    /// This helper remains for backwards compatibility but has no effect on wallpaper rendering.
+    /// Remove in v3.0 when we can break backwards compatibility.
     var tintColor: NSColor? {
         guard let hex = tintColorHex else { return nil }
         return NSColor(hexString: hex)

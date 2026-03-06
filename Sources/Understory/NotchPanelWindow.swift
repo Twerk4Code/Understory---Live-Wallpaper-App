@@ -1,5 +1,6 @@
 import AppKit
 import UniformTypeIdentifiers
+import os
 
 // MARK: - NotchPanelWindow
 final class NotchPanelWindow: NSPanel {
@@ -192,6 +193,7 @@ final class NotchPanelWindow: NSPanel {
     // MARK: - Show / Hide
 
     func showPanel() {
+        os_log("Showing notch panel", log: UnderstoryLogger.notch, type: .debug)
         syncState()
         panelScreen = NotchPanelWindow.findNotchScreen() ?? NSScreen.main ?? NSScreen.screens[0]
         let collapsed = NotchPanelWindow.notchFrame(on: panelScreen, width: notchWidth, height: notchHeight)
@@ -221,6 +223,7 @@ final class NotchPanelWindow: NSPanel {
     }
 
     func hidePanel() {
+        os_log("Hiding notch panel", log: UnderstoryLogger.notch, type: .debug)
         cancelDismissTimer()
         removeClickMonitor()
         let collapsed = NotchPanelWindow.notchFrame(on: panelScreen, width: notchWidth, height: notchHeight)
@@ -247,7 +250,7 @@ final class NotchPanelWindow: NSPanel {
 
     private func startDismissTimer() {
         cancelDismissTimer()
-        dismissTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+        dismissTimer = Timer.scheduledTimer(withTimeInterval: AppConfig.panelDismissTimeout, repeats: false) { [weak self] _ in
             guard let self = self, !self.mouseInside else { return }
             self.hidePanel()
         }

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import os
 
 // Enums moved to WallpaperSettings.swift
 
@@ -62,6 +63,8 @@ final class WallpaperManager {
     // MARK: - Mode Switching
 
     func updateSettings(for screenID: CGDirectDisplayID?, newSettings: ScreenSettings) {
+        assert(Thread.isMainThread, "WallpaperManager.updateSettings must be called from main thread")
+        os_log("Updating wallpaper settings", log: UnderstoryLogger.settings, type: .info)
         if let id = screenID {
             settings[id] = newSettings
         } else {
@@ -113,6 +116,7 @@ final class WallpaperManager {
     private(set) var isPaused = false
 
     func togglePause() {
+        assert(Thread.isMainThread, "WallpaperManager.togglePause must be called from main thread")
         isPaused.toggle()
         for (_, ctx) in contexts {
             if isPaused {
@@ -128,6 +132,7 @@ final class WallpaperManager {
     private(set) var isMuted: Bool = false
 
     func toggleMute() {
+        assert(Thread.isMainThread, "WallpaperManager.toggleMute must be called from main thread")
         isMuted.toggle()
         UserDefaults.standard.set(isMuted, forKey: "com.understory.isMuted")
         for (_, ctx) in contexts {
